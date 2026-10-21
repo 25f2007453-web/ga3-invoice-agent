@@ -111,13 +111,10 @@ class A2AHandler(BaseHTTPRequestHandler):
         return token
 
     def do_GET(self):
-        principal = self.validate_auth()
-        if not principal:
-            return
-
         parsed_url = urlparse(self.path)
         path = parsed_url.path
 
+        # Agent Card is public and does NOT require auth or A2A-Version header
         if path in ("/.well-known/agent-card.json", "/a2a/.well-known/agent-card.json"):
             card = {
                 "name": "GA3 Safe Invoice Action Agent",
@@ -125,17 +122,33 @@ class A2AHandler(BaseHTTPRequestHandler):
                 "version": "1.0.0",
                 "url": PUBLIC_BASE_URL,
                 "protocolVersion": "1.0",
-                "supportedInterfaces": [{"url": PUBLIC_BASE_URL, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
+                "supportedInterfaces": [
+                    {"url": PUBLIC_BASE_URL, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"},
+                    {"url": PUBLIC_BASE_URL.rstrip("/"), "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
+                ],
                 "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": True},
                 "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json", "application/vnd.ga5.invoice-action-results+json"],
                 "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"],
-                "skills": [{"id": "invoice_action_agent", "name": "invoice_action_agent", "description": "Analyzes invoice claim batches.", "tags": ["invoice"]}]
+                "skills": [{
+                    "id": "invoice_action_agent",
+                    "name": "invoice_action_agent",
+                    "description": "Analyzes invoice claim batches.",
+                    "tags": ["invoice", "finance", "accounting", "a2a"],
+                    "inputModes": ["application/vnd.ga5.invoice-claim-batch+json", "application/vnd.ga5.invoice-action-results+json"],
+                    "outputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
+                }]
             }
+            body = json.dumps(card, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("A2A-Version", "1.0")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(json.dumps(card).encode("utf-8"))
+            self.wfile.write(body)
+            return
+
+        principal = self.validate_auth()
+        if not principal:
             return
 
         if path.startswith("/a2a/tasks/") or path.startswith("/tasks/"):
@@ -241,7 +254,6 @@ class A2AHandler(BaseHTTPRequestHandler):
                         pid = str(pkg.get("packageId"))
                         dec = llm_res.get(pid)
                         if not dec or dec.get("action") not in VALID_ACTIONS:
-                            # Intelligent fallback based on package keywords
                             p_str = json.dumps(pkg)
                             act = "settle_invoice"
                             if "duplicate" in p_str.lower():
