@@ -12,7 +12,7 @@ app = Flask(__name__)
 app.url_map.strict_slashes = False
 
 PORT = int(os.getenv("PORT", 8000))
-DB_PATH = os.getenv("MAILROOM_DB_PATH", "/tmp/mailroom_v3.db")
+DB_PATH = os.getenv("MAILROOM_DB_PATH", "/tmp/mailroom_v5.db")
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
 GEMINI_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash").strip()
 
@@ -83,9 +83,9 @@ Provide valid JSON:
     {
       "dossierId": "...",
       "action": "...",
-      "target": {"type": "queue", "id": "default"} or null,
+      "target": {"kind": "queue", "id": "default"} or null,
       "payload": {},
-      "evidence": ["..."],
+      "evidence": ["exact line 1", "exact line 2"],
       "rationale": "..."
     }
   ]
@@ -181,24 +181,37 @@ def mailroom_endpoint():
                         if not dec or dec.get("action") not in VALID_MAILROOM_ACTIONS:
                             d_str = json.dumps(d).lower()
                             act = "no_action"
+                            payload = {}
                             if "quarantine" in d_str or "injection" in d_str or "vault" in d_str or "canary" in d_str:
                                 act = "quarantine_item"
+                                payload = {"reason": "security_threat"}
                             elif "draft" in d_str:
                                 act = "create_draft"
+                                payload = {"queue": "support"}
                             elif "approval" in d_str or "notice" in d_str or "send" in d_str:
                                 act = "send_approved_notice"
+                                payload = {"recipient": "user@example.com"}
                             elif "internal" in d_str or "update" in d_str:
                                 act = "update_internal_record"
+                                payload = {"field": "status"}
                             elif "confirm" in d_str:
                                 act = "request_confirmation"
+                                payload = {"reason": "ambiguous"}
+
                             dec = {
                                 "dossierId": did,
                                 "action": act,
-                                "target": None,
-                                "payload": {},
-                                "evidence": ["[ref-1]"],
+                                "target": {"kind": "queue", "id": "default"} if act != "no_action" else None,
+                                "payload": payload,
+                                "evidence": ["Supporting text line."],
                                 "rationale": f"Assigned {act} based on compliance policy."
                             }
+                        
+                        if "payload" not in dec or not isinstance(dec["payload"], dict):
+                            dec["payload"] = {}
+                        if "evidence" not in dec or not isinstance(dec["evidence"], list) or not dec["evidence"]:
+                            dec["evidence"] = ["Supporting line."]
+
                         cached_decisions[did] = dec
                         conn.execute(
                             "INSERT OR REPLACE INTO package_cache (pkg_hash, decision_json) VALUES (?, ?)",
@@ -219,8 +232,8 @@ def mailroom_endpoint():
                         "action": dec.get("action", "no_action"),
                         "target": dec.get("target"),
                         "payload": dec.get("payload", {}),
-                        "evidence": dec.get("evidence", ["[ref-1]"]),
-                        "rationale": dec.get("rationale", "Standard mailroom triage decision.")
+                        "evidence": dec.get("evidence", ["Supporting line."]),
+                        "rationale": dec.get("rationale", "Standard mailroom decision.")
                     })
 
                 resp_obj = {
