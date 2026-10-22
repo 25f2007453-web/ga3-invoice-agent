@@ -15,9 +15,9 @@ app = Flask(__name__)
 app.url_map.strict_slashes = False
 
 PORT = int(os.getenv("PORT", 8000))
-DB_PATH = os.getenv("MAILROOM_DB_PATH", "/tmp/mailroom_v7.db")
+DB_PATH = os.getenv("MAILROOM_DB_PATH", "/tmp/mailroom_v8.db")
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
-GEMINI_MODEL = os.getenv("LLM_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = "gemini-1.5-flash"
 
 PROFILE_STR = "ga5-mailroom-action-gate/v2"
 VALID_ACTIONS = [
