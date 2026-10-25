@@ -122,7 +122,6 @@ async def create_incident(request: Request):
     tool_catalog = body.get("toolCatalog", [])
     policy = body.get("policy", {})
 
-    # Fast deterministic diagnosis without external API calls
     full_text = json.dumps(incident_obj, ensure_ascii=False).lower()
     selected_cause = allowed_causes[0]
     for cause in allowed_causes:
@@ -312,7 +311,7 @@ async def post_incident_receipts(run_id: str, request: Request):
                 save_incident_to_db(run_id, record)
                 return JSONResponse(status_code=200, content=record["current_response"])
 
-        effect_outcomes = [r for r in record["receipt_log"] if r.get("status") == 200 and r.get("resultClass"] in ["success", "effect_applied"]]
+        effect_outcomes = [r for r in record["receipt_log"] if r.get("status") == 200 and r.get("resultClass") in ["success", "effect_applied"]]
         if effect_outcomes or (record["chosen_effect"] and any(r.get("status") == 200 for r in record["receipt_log"])):
             record["status"] = "completed"
             final_resp = build_final_otlp_response(record)
