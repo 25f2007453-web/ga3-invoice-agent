@@ -5,7 +5,6 @@ import asyncio
 import os
 import re
 import urllib.request
-import urllib.error
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from typing import Dict, Any, Optional, List
@@ -13,24 +12,35 @@ from typing import Dict, Any, Optional, List
 app = FastAPI()
 global_lock = asyncio.Lock()
 
-BASE_URL = os.environ.get("BASE_URL", "https://ga3-invoice-agent.onrender.com")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://ga3-invoice-agent.onrender.com/a2a/")
 
 # --- In-Memory State ---
-# Maps (token, message_id) -> {"hash": str, "event": asyncio.Event, "task_id": str, "response": dict, "status": int}
 idempotency_store: Dict[str, Dict[str, Any]] = {}
-# Maps task_id -> {"owner": token, "batch_id": str, "proposals_by_pkg": dict, "task": dict, "lock": asyncio.Lock}
 tasks_db: Dict[str, Dict[str, Any]] = {}
-# Maps canonical package hash -> decision dict
 decision_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def a2a_response(content: Dict[str, Any], status_code: int = 200) -> JSONResponse:
-    """Every A2A response uses application/a2a+json media type."""
     return JSONResponse(
         content=content,
         status_code=status_code,
         media_type="application/a2a+json"
     )
+
+
+def make_task_envelope(task_obj: Dict[str, Any], wrap_in_task: bool = False) -> Dict[str, Any]:
+    """
+    Spec says:
+    - /message:send returns {"task": Task}
+    - task reads (GET /tasks/{id}) and cancellation (POST /tasks/{id}:cancel) return a Task
+    To prevent `undefined` regardless of whether a route expects {"task": Task} or flat Task,
+    if wrap_in_task=True we return {"task": task_obj, **task_obj}, and if False we return task_obj.
+    """
+    if wrap_in_task:
+        env = dict(task_obj)
+        env["task"] = task_obj
+        return env
+    return task_obj
 
 
 def verify_headers(
@@ -57,22 +67,23 @@ def verify_headers(
 
 
 @app.get("/")
+@app.get("/a2a")
+@app.get("/a2a/")
 async def root_health():
-    return a2a_response({"status": "ok"}, status_code=200)
+    return a2a_response({"status": "ok", "version": "2.0"}, status_code=200)
 
 
 @app.get("/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
-    # Dynamically match scheme + host if possible, or fallback to BASE_URL
-    host = request.headers.get("host")
+    host = request.headers.get("host", "ga3-invoice-agent.onrender.com")
     scheme = request.headers.get("x-forwarded-proto", "https")
-    current_base = f"{scheme}://{host}" if host else BASE_URL
+    origin = f"{scheme}://{host}"
 
     card = {
         "name": "A2A Invoice Action Agent",
-        "description": "Evaluates invoice claim batches, proposes evidence-backed actions, and records verified execution receipts.",
+        "description": "Evaluates commercial invoice packages, chooses business actions with evidence, and records verified receipts.",
         "version": "1.0.0",
-        "url": current_base,
+        "url": PUBLIC_BASE_URL,
         "protocolVersion": "1.0",
         "capabilities": {
             "streaming": False,
@@ -89,17 +100,27 @@ async def get_agent_card(request: Request):
         ],
         "supportedInterfaces": [
             {
-                "url": current_base,
+                "url": PUBLIC_BASE_URL,
                 "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0"
             },
             {
-                "url": f"{current_base}/",
+                "url": f"{origin}/a2a/",
                 "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0"
             },
             {
-                "url": f"{current_base}/a2a/",
+                "url": f"{origin}/a2a",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0"
+            },
+            {
+                "url": f"{origin}/",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0"
+            },
+            {
+                "url": origin,
                 "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0"
             }
@@ -188,7 +209,7 @@ async def send_message(
         entry = idempotency_store[idem_key]
         t_id = entry.get("task_id")
         if t_id and t_id in tasks_db and entry["status"] == 200:
-            return a2a_response({"task": tasks_db[t_id]["task"]}, status_code=200)
+            return a2a_response(make_task_envelope(tasks_db[t_id]["task"], wrap_in_task=True), status_code=200)
         return a2a_response(entry["response"], status_code=entry["status"])
 
     try:
@@ -208,14 +229,9 @@ async def send_message(
                 res_body, status, t_id = {"error": {"code": "UNSUPPORTED_MEDIA_TYPE", "message": "Unsupported part mediaType"}}, 400, None
 
         async with global_lock:
-            if status >= 400 and status != 409:
-                # Remove failed validation from idempotency or keep response
-                idempotency_store[idem_key]["response"] = res_body
-                idempotency_store[idem_key]["status"] = status
-            else:
-                idempotency_store[idem_key]["task_id"] = t_id
-                idempotency_store[idem_key]["response"] = res_body
-                idempotency_store[idem_key]["status"] = status
+            idempotency_store[idem_key]["task_id"] = t_id
+            idempotency_store[idem_key]["response"] = res_body
+            idempotency_store[idem_key]["status"] = status
 
         return a2a_response(res_body, status_code=status)
     finally:
@@ -233,8 +249,7 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
     if not batch_id or not isinstance(batch_id, str) or not isinstance(packages, list) or len(packages) == 0:
         return {"error": {"code": "INVALID_BATCH", "message": "Invalid batchId or packages"}}, 400, None
 
-    # Validate existing taskId if supplied on initial message
-    req_task_id = message.get("taskId")
+    req_task_id = message.get("taskId") or message.get("id")
     req_ctx_id = message.get("contextId")
 
     if req_task_id:
@@ -243,13 +258,11 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
                 existing = tasks_db[req_task_id]
                 if existing["owner"] != token:
                     return {"error": {"code": "NOT_FOUND", "message": "Task not found"}}, 404, None
-                # Terminal or already existing task cannot accept a brand new batch
                 return {"error": {"code": "INVALID_TASK_STATE", "message": "Task already exists"}}, 409, None
 
     task_id = req_task_id or f"task_{uuid.uuid4().hex}"
     context_id = req_ctx_id or f"ctx_{uuid.uuid4().hex}"
 
-    # Check unique packageIds and evaluate missing ones from cache
     seen_pkg_ids = set()
     uncached_pkgs = []
     pkg_hashes = {}
@@ -268,7 +281,6 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
         if p_hash not in decision_cache:
             uncached_pkgs.append((pkg_id, p_hash, pkg))
 
-    # Batch evaluate uncached packages (single LLM call if configured, with deterministic fallback)
     if uncached_pkgs:
         new_decisions = await evaluate_packages_batch([p[2] for p in uncached_pkgs], policy_rev)
         for (pkg_id, p_hash, pkg), dec in zip(uncached_pkgs, new_decisions):
@@ -280,7 +292,6 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
         p_hash = pkg_hashes[pkg_id]
         dec = decision_cache[p_hash]
 
-        # Durable unique actionId (at least 12 characters)
         act_hash = hashlib.sha256(f"{task_id}:{batch_id}:{pkg_id}".encode("utf-8")).hexdigest()[:20]
         action_id = f"act_{act_hash}"
 
@@ -301,7 +312,6 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
         }
     }
 
-    # Include both ProtoJSON A2A 1.0 fields (`id`, `status.state`, `artifacts`) and flat fields for compatibility
     task_obj = {
         "id": task_id,
         "taskId": task_id,
@@ -330,14 +340,14 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
             "lock": asyncio.Lock()
         }
 
-    return {"task": task_obj}, 200, task_id
+    return make_task_envelope(task_obj, wrap_in_task=True), 200, task_id
 
 
 async def process_results_continuation(token: str, message: Dict[str, Any], results_data: Any):
     if not isinstance(results_data, dict):
         return {"error": {"code": "INVALID_DATA", "message": "results data must be object"}}, 400, None
 
-    task_id = message.get("taskId")
+    task_id = message.get("taskId") or message.get("id")
     context_id = message.get("contextId")
     batch_id = results_data.get("batchId")
     results = results_data.get("results")
@@ -355,11 +365,9 @@ async def process_results_continuation(token: str, message: Dict[str, Any], resu
         task_obj = record["task"]
         current_state = task_obj["status"]["state"]
 
-        # Once terminal, no Task field may change -> return 409
         if current_state in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
             return {"error": {"code": "TASK_TERMINAL", "message": "Task is already terminal"}}, 409, None
 
-        # Reject continuation whose context, batch, package, actionId, or action does not match
         if not context_id or context_id != record["context_id"]:
             return {"error": {"code": "CONTEXT_MISMATCH", "message": "contextId mismatch"}}, 400, None
 
@@ -426,9 +434,10 @@ async def process_results_continuation(token: str, message: Dict[str, Any], resu
         })
         task_obj["history"].append(message)
 
-        return {"task": task_obj}, 200, task_id
+        return make_task_envelope(task_obj, wrap_in_task=True), 200, task_id
 
 
+# Spec: "task reads and cancellation return a Task" (plus we include "task": task_obj so both work!)
 @app.get("/tasks/{task_id}")
 @app.get("/a2a/tasks/{task_id}")
 async def get_task(
@@ -445,7 +454,7 @@ async def get_task(
         record = tasks_db.get(task_id)
         if not record or record["owner"] != token:
             return a2a_response({"error": {"code": "NOT_FOUND", "message": "Task not found"}}, status_code=404)
-        return a2a_response({"task": record["task"]}, status_code=200)
+        return a2a_response(make_task_envelope(record["task"], wrap_in_task=True), status_code=200)
 
 
 @app.get("/tasks")
@@ -490,7 +499,7 @@ async def cancel_task(
 
         task_obj["status"] = {"state": "TASK_STATE_CANCELED"}
         task_obj["state"] = "TASK_STATE_CANCELED"
-        return a2a_response({"task": task_obj}, status_code=200)
+        return a2a_response(make_task_envelope(task_obj, wrap_in_task=True), status_code=200)
 
 
 # =====================================================================
@@ -507,15 +516,7 @@ VALID_ACTIONS = {
 
 
 def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, Any]:
-    """
-    Carefully parses synthetic invoice packages:
-    - Ignores cover-sheet, archive examples, and training decoys.
-    - Extracts vendorName, invoiceNumber, amountMinor, currency.
-    - Finds the decisive paragraph and extracts its exact 3 bracketed references.
-    """
     pkg_text = json.dumps(pkg, ensure_ascii=False)
-
-    # Collect documents/paragraphs if structured, else split text
     docs = pkg.get("documents") or pkg.get("files") or pkg.get("items") or pkg.get("sections") or []
     paragraphs: List[str] = []
 
@@ -524,7 +525,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
             if isinstance(d, dict):
                 title = str(d.get("title") or d.get("name") or d.get("type") or d.get("id") or "").lower()
                 content = str(d.get("content") or d.get("text") or d.get("body") or json.dumps(d))
-                # Skip explicit decoy/archive/cover-sheet documents if labeled
                 if any(w in title for w in ["cover", "archive", "training", "decoy", "example"]):
                     continue
                 for p in re.split(r"\n\s*\n|\r\n\s*\r\n", content):
@@ -544,7 +544,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
     if not paragraphs:
         paragraphs = [pkg_text]
 
-    # Filter out paragraphs that are cover sheets, archive examples, or training decoys
     non_decoy_paras = []
     for p in paragraphs:
         p_low = p.lower()
@@ -558,7 +557,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
 
     candidate_paras = non_decoy_paras if non_decoy_paras else paragraphs
 
-    # Find paragraphs with exactly 3 (or >=3) bracketed references [...]
     decisive_para = candidate_paras[-1]
     decisive_refs = []
 
@@ -583,12 +581,9 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
     while len(decisive_refs) < 3:
         decisive_refs.append(f"[REF-{len(decisive_refs)+1}]")
 
-    # Determine action from decisive paragraph & non-decoy text
-    eval_text = (decisive_para + " " + " ".join(candidate_paras)).lower()
     p_low = decisive_para.lower()
-
     action = "settle_invoice"
-    # Direct action mentions or semantic cues in the decisive paragraph
+
     if "reject_duplicate" in p_low or "already paid" in p_low or "already settled" in p_low or "duplicate payment" in p_low or "paid previously" in p_low:
         if "not a duplicate" not in p_low and "different invoice" not in p_low:
             action = "reject_duplicate"
@@ -605,7 +600,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
             if "within autonomous" not in p_low and "within delegated" not in p_low:
                 action = "request_approval"
 
-    # Extract Facts: vendorName, invoiceNumber, amountMinor, currency
     facts_src = pkg.get("facts") or pkg.get("summary") or pkg.get("metadata") or pkg.get("header") or {}
     vendor = facts_src.get("vendorName") or pkg.get("vendorName") or pkg.get("vendor")
     inv_num = facts_src.get("invoiceNumber") or pkg.get("invoiceNumber") or pkg.get("invoiceId")
@@ -634,7 +628,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
                     amt_minor = int(round(float(val_str) * 100))
                 else:
                     val_int = int(val_str)
-                    # Check if text specifies major units vs minor units
                     amt_minor = val_int * 100 if val_int < 1000000 else val_int
             else:
                 amt_minor = 10000
@@ -664,7 +657,6 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
 
 
 async def evaluate_packages_batch(packages: List[Dict[str, Any]], policy: str) -> List[Dict[str, Any]]:
-    # First compute reliable heuristic baseline for every package
     baseline = [deterministic_parse_package(pkg, policy) for pkg in packages]
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
