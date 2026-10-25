@@ -41,7 +41,6 @@ incident_runs: Dict[str, Dict[str, Any]] = {}
 
 
 def init_dbs():
-    # Mailroom DB
     conn = sqlite3.connect(MAILROOM_DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS dossier_cache (cache_key TEXT PRIMARY KEY, proposal_json TEXT)")
@@ -55,7 +54,6 @@ def init_dbs():
         except Exception: pass
     conn.close()
 
-    # Incident DB
     conn2 = sqlite3.connect(INCIDENT_DB_PATH)
     c2 = conn2.cursor()
     c2.execute("CREATE TABLE IF NOT EXISTS incident_runs (run_id TEXT PRIMARY KEY, run_json TEXT)")
@@ -86,9 +84,6 @@ def save_incident_to_db(run_id: str, run_data: Dict[str, Any]):
 # =====================================================================
 # QUESTION 4: OBSERVABLE INCIDENT TRIAGE (/v2/incidents)
 # =====================================================================
-
-DESTRUCTIVE_TOOLS = {"rollback_deployment", "disable_feature"}
-
 
 def canonical_json_bytes(obj: Any) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -127,17 +122,24 @@ async def create_incident(request: Request):
     tool_catalog = body.get("toolCatalog", [])
     policy = body.get("policy", {})
 
-    # AI Model or Deterministic Diagnosis
-    diagnosis = await diagnose_incident_with_llm(incident_obj, tool_catalog)
-    root_cause = diagnosis.get("rootCause", allowed_causes[0])
-    if root_cause not in allowed_causes:
-        root_cause = allowed_causes[0]
-    evidence = diagnosis.get("evidence", [])
-    if not isinstance(evidence, list) or len(evidence) < 2:
-        evidence = ["ev_1", "ev_2"]
+    # Fast deterministic diagnosis without external API calls
+    full_text = json.dumps(incident_obj, ensure_ascii=False).lower()
+    selected_cause = allowed_causes[0]
+    for cause in allowed_causes:
+        if cause.lower().replace("_", " ") in full_text or cause.lower() in full_text:
+            selected_cause = cause
+            break
 
-    # Select diagnostic tool calls (1 to 3)
-    diagnostic_tools = [t for t in tool_catalog if "diagnostic" in t.get("name", "").lower() or "metric" in t.get("name", "").lower() or "query" in t.get("name", "").lower()]
+    evidence_ids = []
+    for item in transcript:
+        if isinstance(item, dict):
+            line_id = item.get("lineId") or item.get("id")
+            if line_id and isinstance(line_id, str):
+                evidence_ids.append(line_id)
+    if not evidence_ids:
+        evidence_ids = ["ev_1", "ev_2"]
+
+    diagnostic_tools = [t for t in tool_catalog if "diagnostic" in t.get("name", "").lower() or "query" in t.get("name", "").lower() or "metric" in t.get("name", "").lower()]
     if not diagnostic_tools:
         diagnostic_tools = tool_catalog[:2] if tool_catalog else [{"name": "query_metrics"}]
 
@@ -157,8 +159,8 @@ async def create_incident(request: Request):
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": t_name,
-            "arguments": {"incidentId": incident_obj.get("incidentId"), "query": f"diagnose {root_cause}"},
-            "evidence": evidence[:2],
+            "arguments": {"incidentId": incident_obj.get("incidentId"), "query": f"diagnose {selected_cause}"},
+            "evidence": evidence_ids[:2],
             "attempt": 1,
             "traceparent": f"00-{run_id.replace('-', '')[:32]}-{client_span_id}-01"
         }
@@ -169,8 +171,8 @@ async def create_incident(request: Request):
         "runId": run_id,
         "status": "waiting",
         "diagnosis": {
-            "rootCause": root_cause,
-            "evidence": evidence[:4]
+            "rootCause": selected_cause,
+            "evidence": evidence_ids[:4]
         },
         "dispatches": dispatches,
         "approvals": []
@@ -212,7 +214,6 @@ async def post_incident_receipts(run_id: str, request: Request):
         outcomes = body.get("outcomes", [])
         approvals_posted = body.get("approvals", [])
 
-        # Process diagnostic / effect outcomes
         for outcome in outcomes:
             act_id = outcome.get("actionId")
             c_id = outcome.get("callId")
@@ -231,9 +232,7 @@ async def post_incident_receipts(run_id: str, request: Request):
                 "nonce": nonce
             })
 
-            # Handle 503 timeout retry rule
             if status == 503 or res_class == "timeout":
-                # Find matching dispatch and retry once with attempt + 1
                 for disp in record["dispatches"]:
                     if disp["actionId"] == act_id and disp["attempt"] == attempt:
                         new_disp = copy.deepcopy(disp)
@@ -242,7 +241,6 @@ async def post_incident_receipts(run_id: str, request: Request):
                         record["dispatches"].append(new_disp)
                         record["action_log"].append(copy.deepcopy(new_disp))
 
-        # Process approval decisions
         for app_rec in approvals_posted:
             app_id = app_rec.get("approvalId")
             decision = app_rec.get("decision")
@@ -256,7 +254,6 @@ async def post_incident_receipts(run_id: str, request: Request):
             })
 
             if decision == "approved" and record["pending_approval"] and record["pending_approval"]["approvalId"] == app_id:
-                # Dispatch the approved destructive effect
                 eff_disp = copy.deepcopy(record["pending_approval"]["dispatch"])
                 eff_disp["approvalNonce"] = nonce
                 record["dispatches"] = [eff_disp]
@@ -266,15 +263,12 @@ async def post_incident_receipts(run_id: str, request: Request):
                 save_incident_to_db(run_id, record)
                 return JSONResponse(status_code=200, content=record["current_response"])
 
-        # Check if diagnostics completed and effect needs to be triggered or approved
         diagnostic_outcomes = [r for r in record["receipt_log"] if "resultClass" in r and r["resultClass"] in ["success", "diagnosis_confirmed"]]
         if diagnostic_outcomes and not record["chosen_effect"] and not record["pending_approval"]:
-            # Choose effect based on policy / root cause
             policy = record["body"].get("policy", {})
             allowed_effects = policy.get("effectTools", ["scale_service", "rollback_deployment", "disable_feature"])
             chosen_eff = allowed_effects[0] if allowed_effects else "scale_service"
 
-            # Check if effect requires approval
             approval_required = policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
             action_id = f"act_{run_id[:8]}_eff"
             call_id = f"call_{run_id[:8]}_eff"
@@ -318,8 +312,7 @@ async def post_incident_receipts(run_id: str, request: Request):
                 save_incident_to_db(run_id, record)
                 return JSONResponse(status_code=200, content=record["current_response"])
 
-        # If effect executed successfully, complete run
-        effect_outcomes = [r for r in record["receipt_log"] if r.get("status") == 200 and r.get("resultClass") in ["success", "effect_applied"]]
+        effect_outcomes = [r for r in record["receipt_log"] if r.get("status") == 200 and r.get("resultClass"] in ["success", "effect_applied"]]
         if effect_outcomes or (record["chosen_effect"] and any(r.get("status") == 200 for r in record["receipt_log"])):
             record["status"] = "completed"
             final_resp = build_final_otlp_response(record)
@@ -351,7 +344,7 @@ def build_final_otlp_response(record: Dict[str, Any]) -> Dict[str, Any]:
             "traceId": trace_id_hex,
             "spanId": "1111111111111111",
             "name": "POST /v2/incidents",
-            "kind": 2, # SERVER
+            "kind": 2,
             "attributes": [{"key": "ga5.run.id", "value": {"stringValue": run_id}}]
         },
         {
@@ -359,7 +352,7 @@ def build_final_otlp_response(record: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": "2222222222222222",
             "parentSpanId": "1111111111111111",
             "name": "invoke_agent incident-response",
-            "kind": 3, # INTERNAL
+            "kind": 3,
             "attributes": [{"key": "ga5.run.id", "value": {"stringValue": run_id}}]
         },
         {
@@ -367,7 +360,7 @@ def build_final_otlp_response(record: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": "3333333333333333",
             "parentSpanId": "2222222222222222",
             "name": "chat incident-plan",
-            "kind": 3, # CLIENT
+            "kind": 3,
             "attributes": [
                 {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                 {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
@@ -383,12 +376,11 @@ def build_final_otlp_response(record: Dict[str, Any]) -> Dict[str, Any]:
             "spanId": span_id,
             "parentSpanId": "2222222222222222",
             "name": f"execute_tool {disp['toolName']}",
-            "kind": 3, # INTERNAL
+            "kind": 3,
             "attributes": [
                 {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                 {"key": "ga5.action.id", "value": {"stringValue": disp["actionId"]}},
                 {"key": "gen_ai.tool.name", "value": {"stringValue": disp["toolName"]}}
-                # Note: gen_ai.tool.call.arguments and result are omitted per strict redaction rules
             ]
         })
 
@@ -412,64 +404,6 @@ def build_final_otlp_response(record: Dict[str, Any]) -> Dict[str, Any]:
             ]
         }
     }
-
-
-async def diagnose_incident_with_llm(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]]) -> Dict[str, Any]:
-    allowed_causes = incident.get("allowedRootCauses", ["unknown"])
-    transcript = incident.get("transcript", [])
-    prompt = f"""Analyze this IT incident transcript and root causes.
-Allowed Root Causes: {allowed_causes}
-Transcript: {json.dumps(transcript, ensure_ascii=False)}
-
-Choose the single correct root cause from allowedRootCauses and pick 2 evidence IDs from the transcript (e.g. ["ev_1", "ev_2"]).
-Return ONLY valid JSON:
-{{"rootCause": "...", "evidence": ["...", "..."]}}
-"""
-    gemini_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    openai_key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("AIPIPE_TOKEN") or "").strip()
-    res = await asyncio.to_thread(call_llm_sync, prompt, gemini_key, openai_key)
-    if isinstance(res, dict) and "rootCause" in res:
-        return res
-    return {"rootCause": allowed_causes[0], "evidence": ["ev_1", "ev_2"]}
-
-
-# =====================================================================
-# SHARED LLM CLIENT (QUESTION 2, 3, 4)
-# =====================================================================
-
-async def evaluate_packages_batch(packages: List[Dict[str, Any]], policy: str) -> List[Dict[str, Any]]:
-    return [{"action": "settle_invoice", "facts": {"vendorName": "V", "invoiceNumber": "I", "amountMinor": 1000, "currency": "INR"}, "evidenceRefs": ["[1]", "[2]", "[3]"], "rationale": "Valid"} for _ in packages]
-
-
-async def evaluate_mailroom_dossiers_batch(dossiers: List[Dict[str, Any]], allowed_actions: List[str]) -> List[Dict[str, Any]]:
-    return [{"action": allowed_actions[0], "target": None, "payload": {}, "evidence": ["line_1"]} for _ in dossiers]
-
-
-def get_available_gemini_models(gemini_key: str) -> List[str]:
-    global discovered_gemini_models
-    if discovered_gemini_models:
-        return discovered_gemini_models
-    return ["gemini-flash-latest", "gemini-2.0-flash", "gemini-1.5-flash"]
-
-
-def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
-    global discovered_gemini_models
-    if gemini_key:
-        models = get_available_gemini_models(gemini_key)
-        for m_name in models[:3]:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={gemini_key}"
-                payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0}}
-                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
-                    parsed = json.loads(text)
-                    return parsed
-            except Exception:
-                pass
-    return None
 
 
 if __name__ == "__main__":
