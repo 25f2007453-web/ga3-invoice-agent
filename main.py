@@ -74,7 +74,9 @@ async def send_message(request: Request, token: str = Depends(verify_a2a_protoco
             return JSONResponse(content={"task": tasks_db[f"{token}_{task_id}"]})
 
         idempotency_store[idem_key] = message_hash
-        task_id = str(uuid.uuid4())
+        # FIXED: Use the messageId for the task_id to ensure idempotency lookups succeed
+        task_id = message.get("taskId") or message_id
+        
         parts = message.get("parts", [])
         proposals = []
         batch_id = ""
@@ -185,7 +187,7 @@ async def get_task(task_id: str, token: str = Depends(verify_a2a_protocol)):
     return JSONResponse(content={"task": tasks_db[task_key]}, media_type="application/a2a+json")
 
 async def evaluate_package_with_llm(package: Dict, policy: str) -> Dict:
-    # Replace this block with your actual GenAI/LLM call
+    # Replace this block with your actual GenAI/LLM call before the final submission
     return {
         "action": "settle_invoice",
         "facts": {"vendorName": "Vendor X", "invoiceNumber": "INV-1", "amountMinor": 12345, "currency": "INR"},
