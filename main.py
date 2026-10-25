@@ -17,12 +17,10 @@ global_lock = asyncio.Lock()
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or "https://ga3-invoice-agent.onrender.com/a2a/").strip()
 
 # --- In-Memory State ---
-# Maps (token, message_id) -> {"hash": str, "event": asyncio.Event, "task_id": Optional[str], "response": dict, "status": int}
 idempotency_store: Dict[str, Dict[str, Any]] = {}
-# Maps task_id -> {"owner": str, "batch_id": str, "context_id": str, "proposals_by_pkg": dict, "task": dict, "lock": asyncio.Lock}
 tasks_db: Dict[str, Dict[str, Any]] = {}
-# Maps canonical package+policy hash -> decision dict
 decision_cache: Dict[str, Dict[str, Any]] = {}
+discovered_gemini_models: List[str] = []
 
 
 def a2a_response(content: Dict[str, Any], status_code: int = 200) -> JSONResponse:
@@ -74,10 +72,6 @@ def verify_headers(
 
 
 def compact_task_for_list(task_obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep task list responses well under 512 KiB while preserving all Task fields,
-    artifacts, status, and history metadata.
-    """
     t = copy.deepcopy(task_obj)
     if "history" in t and isinstance(t["history"], list):
         compact_hist = []
@@ -97,7 +91,6 @@ def compact_task_for_list(task_obj: Dict[str, Any]) -> Dict[str, Any]:
                         if isinstance(p, dict):
                             p_data = p.get("data")
                             if isinstance(p_data, dict) and "packages" in p_data:
-                                # Keep batchId and policyRevision, summarize packages only if huge
                                 c_parts.append({
                                     "mediaType": p.get("mediaType"),
                                     "data": {
@@ -117,7 +110,22 @@ def compact_task_for_list(task_obj: Dict[str, Any]) -> Dict[str, Any]:
 @app.get("/a2a")
 @app.get("/a2a/")
 async def root_health():
-    return a2a_response({"status": "ok", "version": "3.0"}, status_code=200)
+    return a2a_response({"status": "ok", "version": "4.0"}, status_code=200)
+
+
+@app.get("/test-llm")
+async def test_llm_endpoint():
+    """Browser diagnostic endpoint to verify Gemini API key and model before clicking Check."""
+    gemini_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    openai_key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("AIPIPE_TOKEN") or "").strip()
+    models = await asyncio.to_thread(get_available_gemini_models, gemini_key) if gemini_key else []
+    test_prompt = 'Return a JSON array with 1 object: [{"status": "working", "model": "ok"}]'
+    res = await asyncio.to_thread(call_llm_sync, test_prompt, gemini_key, openai_key)
+    return a2a_response({
+        "llm_working": res is not None,
+        "test_output": res,
+        "discovered_models": models[:10]
+    })
 
 
 @app.get("/.well-known/agent-card.json")
@@ -224,7 +232,6 @@ async def send_message(
     if role != "ROLE_USER":
         return a2a_response({"code": "INVALID_ROLE", "error": {"code": "INVALID_ROLE", "message": "ROLE_USER required"}}, status_code=400)
 
-    # Hash recursively key-sorted compact JSON of the message only; ignore configuration
     canonical_msg = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     msg_hash = hashlib.sha256(canonical_msg.encode("utf-8")).hexdigest()
     idem_key = f"{token}:{message_id}"
@@ -330,7 +337,6 @@ async def process_batch_message(token: str, message: Dict[str, Any], batch_data:
             return {"code": "DUPLICATE_PACKAGE_ID", "error": {"code": "DUPLICATE_PACKAGE_ID", "message": "Duplicate or missing packageId"}}, 400, None
         seen_pkg_ids.add(pkg_id)
 
-        # Canonical package content hash
         canon = json.dumps(pkg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         p_hash = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         pkg_hashes[pkg_id] = p_hash
@@ -420,7 +426,6 @@ async def process_results_continuation(token: str, message: Dict[str, Any], resu
         task_obj = record["task"]
         current_state = task_obj["status"]["state"]
 
-        # Reject mismatched context or batch before checking terminal or after?
         if not context_id or context_id != record["context_id"]:
             return {"code": "CONTEXT_MISMATCH", "error": {"code": "CONTEXT_MISMATCH", "message": "contextId mismatch"}}, 400, None
 
@@ -470,7 +475,6 @@ async def process_results_continuation(token: str, message: Dict[str, Any], resu
                     "evidenceRefs": copy.deepcopy(stored["evidenceRefs"])
                 })
 
-        # Atomic check-and-transition inside task_lock for cancel-vs-receipt race
         if current_state in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
             return {"code": "TASK_TERMINAL", "error": {"code": "TASK_TERMINAL", "message": "Task is already terminal"}}, 409, None
 
@@ -495,7 +499,6 @@ async def process_results_continuation(token: str, message: Dict[str, Any], resu
         return {"task": copy.deepcopy(new_task_obj)}, 200, task_id
 
 
-# Spec: "task reads and cancellation return a Task"
 @app.get("/tasks/{task_id}")
 @app.get("/a2a/tasks/{task_id}")
 async def get_task(
@@ -581,7 +584,6 @@ VALID_ACTIONS = {
 
 
 def extract_all_ref_tokens(text: str) -> List[str]:
-    """Extract bracketed reference tokens like [INV-1] and return both bracketed and unbracketed awareness."""
     return re.findall(r"\[[^\[\]\n]{1,50}\]", text)
 
 
@@ -735,33 +737,32 @@ def deterministic_parse_package(pkg: Dict[str, Any], policy: str) -> Dict[str, A
     }
 
 
-async def evaluate_chunk_with_llm(chunk: List[Dict[str, Any]], policy: str, gemini_key: str, openai_key: str) -> Optional[List[Dict[str, Any]]]:
-    prompt = f"""You are an expert A2A Invoice Audit Agent. Evaluate each invoice package in the JSON list below under the Policy Revision: "{policy}".
+def build_batch_prompt(chunk: List[Dict[str, Any]], policy: str) -> str:
+    return f"""You are an expert A2A Invoice Audit Agent. Read the Policy Revision ("{policy}") and evaluate each invoice package in the JSON list below.
 
 Choose EXACTLY ONE action per package:
-- "settle_invoice": commercially valid, reconciled, and within autonomous authority limits.
-- "request_approval": commercially valid and reconciled, but amount is outside autonomous/delegated authority limits.
-- "hold_invoice": payment must pause until a stated verification, inspection, or receipt step completes.
-- "reject_duplicate": the exact same commercial invoice number was already paid/settled (Note: a prior payment for a DIFFERENT invoice number is NOT a duplicate).
-- "open_exception": material records conflict (e.g., PO vs invoice vs GRN mismatch, vendor/bank conflict, disputed or contradictory material facts) requiring an exception workflow.
+- "settle_invoice": valid, reconciled, and within autonomous authority limits.
+- "request_approval": commercially valid and reconciled, but outside delegated/autonomous authority limits.
+- "hold_invoice": payment pauses until a stated verification, inspection, or receipt step completes.
+- "reject_duplicate": the exact same commercial invoice was already paid (a payment for a DIFFERENT invoice number is NOT a duplicate).
+- "open_exception": material records conflict (e.g., PO/GRN/invoice amount/quantity/vendor/bank conflict or discrepancy) and need an exception workflow.
 
 CRITICAL EVIDENCE & FACTS RULES:
-1. Documents mix controlling facts with cover sheets, archive examples, training decoys, negation, and irrelevant action words. Ignore cover sheets, archive examples, and training decoys!
-2. Find the single controlling paragraph that determines the action. Extract the EXACT THREE bracketed reference strings from that decisive paragraph in their exact format as they appear in the text (e.g. if the paragraph has [DOC-1], [POL-2], [CHK-3], return those exact 3 strings in "evidenceRefs").
-3. Extract the exact controlling invoice facts:
+1. Documents mix useful controlling facts with cover sheets, archive examples, training decoys, negation, and irrelevant action words. Ignore cover-sheet references, archive examples, and training decoys!
+2. Return EXACTLY THREE decisive bracketed references (e.g. ["[ref1]", "[ref2]", "[ref3]"]) from the single paragraph that determines the action. Keep the brackets `[` and `]` around each reference string exactly as written in the decisive paragraph.
+3. Extract exact controlling invoice facts:
    - "vendorName": exact vendor name string
    - "invoiceNumber": exact invoice number string
-   - "amountMinor": integer amount in minor currency units (e.g. paise for INR / cents for USD; if invoice is INR 1,250.50 -> 125050; if already given as amountMinor, use that exact integer)
-   - "currency": 3-letter currency code (e.g. "INR")
-4. "rationale": 80 to 450 characters. MUST explicitly name the chosen action (e.g. "request_approval"), cite at least two of the exact evidenceRefs, and explain how the controlling facts support the action.
+   - "amountMinor": integer amount in minor currency units (paise/cents; e.g. INR 1,250.00 = 125000, or if amountMinor is explicitly stated, use that integer)
+   - "currency": 3-letter currency string (e.g. "INR")
+4. "rationale": 80 to 450 characters. Name the exact chosen action, cite at least two of the exact evidenceRefs (including brackets), and explain how the controlling facts support the action.
 
 Input Packages JSON:
 {json.dumps(chunk, ensure_ascii=False)}
 
-Return ONLY a JSON array with {len(chunk)} objects in the exact same order, each with keys:
-"packageId", "action", "facts" ("vendorName", "invoiceNumber", "amountMinor", "currency"), "evidenceRefs" (array of 3 strings), "rationale".
+Return ONLY a valid JSON array with {len(chunk)} objects in the exact same order, each with keys:
+"packageId", "action", "facts" ("vendorName", "invoiceNumber", "amountMinor", "currency"), "evidenceRefs" (array of 3 bracketed strings), "rationale".
 """
-    return await asyncio.to_thread(call_llm_sync, prompt, gemini_key, openai_key)
 
 
 async def evaluate_packages_batch(packages: List[Dict[str, Any]], policy: str) -> List[Dict[str, Any]]:
@@ -771,93 +772,140 @@ async def evaluate_packages_batch(packages: List[Dict[str, Any]], policy: str) -
     openai_key = (os.environ.get("OPENAI_API_KEY") or os.environ.get("AIPIPE_TOKEN") or "").strip()
 
     if not gemini_key and not openai_key:
-        print("[LLM] No API key found, using baseline")
+        print("[LLM] No API key configured, using baseline")
         return baseline
 
-    # Split into chunks of 4 packages and run concurrently so LLM is fast (<4s) and never truncates
-    chunk_size = 4
-    chunks = [packages[i:i + chunk_size] for i in range(0, len(packages), chunk_size)]
-    tasks = [evaluate_chunk_with_llm(ch, policy, gemini_key, openai_key) for ch in chunks]
-    chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # First try all packages in 1 batched model call (as recommended by spec: "batch 12 packages into one model call")
+    prompt_all = build_batch_prompt(packages, policy)
+    llm_res = await asyncio.to_thread(call_llm_sync, prompt_all, gemini_key, openai_key)
+
+    # If 12-package single call fails or mismatches length, split into 2 halves of 6 packages
+    if not isinstance(llm_res, list) or len(llm_res) != len(packages):
+        if len(packages) > 1:
+            mid = len(packages) // 2
+            p1 = build_batch_prompt(packages[:mid], policy)
+            p2 = build_batch_prompt(packages[mid:], policy)
+            r1, r2 = await asyncio.gather(
+                asyncio.to_thread(call_llm_sync, p1, gemini_key, openai_key),
+                asyncio.to_thread(call_llm_sync, p2, gemini_key, openai_key)
+            )
+            if isinstance(r1, list) and len(r1) == mid and isinstance(r2, list) and len(r2) == len(packages) - mid:
+                llm_res = r1 + r2
+
+    if not isinstance(llm_res, list) or len(llm_res) != len(packages):
+        print(f"[LLM] Fallback to baseline (llm_res={type(llm_res)})")
+        return baseline
 
     merged_all = []
-    idx = 0
-    for ch, res in zip(chunks, chunk_results):
-        if isinstance(res, list) and len(res) == len(ch):
-            for item in res:
-                base = baseline[idx]
-                idx += 1
-                if not isinstance(item, dict):
-                    merged_all.append(base)
-                    continue
+    for pkg, base, item in zip(packages, baseline, llm_res):
+        if not isinstance(item, dict):
+            merged_all.append(base)
+            continue
 
-                act = str(item.get("action") or "").strip()
-                if act not in VALID_ACTIONS:
-                    act = base["action"]
+        act = str(item.get("action") or "").strip()
+        if act not in VALID_ACTIONS:
+            act = base["action"]
 
-                facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
-                vendor = str(facts.get("vendorName") or base["facts"]["vendorName"]).strip()
-                inv_no = str(facts.get("invoiceNumber") or base["facts"]["invoiceNumber"]).strip()
-                try:
-                    amt = int(facts.get("amountMinor"))
-                except Exception:
-                    amt = base["facts"]["amountMinor"]
-                curr = str(facts.get("currency") or base["facts"]["currency"]).strip()
+        facts = item.get("facts") if isinstance(item.get("facts"), dict) else {}
+        vendor = str(facts.get("vendorName") or base["facts"]["vendorName"]).strip()
+        inv_no = str(facts.get("invoiceNumber") or base["facts"]["invoiceNumber"]).strip()
+        try:
+            amt = int(facts.get("amountMinor"))
+        except Exception:
+            amt = base["facts"]["amountMinor"]
+        curr = str(facts.get("currency") or base["facts"]["currency"]).strip()
 
-                refs = item.get("evidenceRefs")
-                if not isinstance(refs, list) or len(refs) != 3 or not all(isinstance(r, str) and r.strip() for r in refs):
-                    refs = base["evidenceRefs"]
-                else:
-                    refs = [r.strip() for r in refs]
-                    # Check if the package text uses brackets [...] and ensure consistency with package text
-                    pkg_raw = json.dumps(packages[idx - 1], ensure_ascii=False)
-                    fixed_refs = []
-                    for r in refs:
-                        if r in pkg_raw:
-                            fixed_refs.append(r)
-                        elif f"[{r}]" in pkg_raw:
-                            fixed_refs.append(f"[{r}]")
-                        elif r.startswith("[") and r.endswith("]") and r[1:-1] in pkg_raw:
-                            fixed_refs.append(r)
-                        else:
-                            fixed_refs.append(r)
-                    refs = fixed_refs
-
-                rat = str(item.get("rationale") or "").strip()
-                if len(rat) < 65 or act not in rat or sum(1 for r in refs if r in rat) < 2:
-                    rat = (
-                        f"Action {act} is selected for invoice {inv_no} from {vendor} ({amt} {curr}) "
-                        f"based on decisive evidence {refs[0]}, {refs[1]}, and {refs[2]}: {rat}"
-                    ).strip()
-
-                merged_all.append({
-                    "action": act,
-                    "facts": {
-                        "vendorName": vendor,
-                        "invoiceNumber": inv_no,
-                        "amountMinor": amt,
-                        "currency": curr
-                    },
-                    "evidenceRefs": refs,
-                    "rationale": rat[:1450]
-                })
+        refs = item.get("evidenceRefs")
+        pkg_raw = json.dumps(pkg, ensure_ascii=False)
+        if not isinstance(refs, list) or len(refs) != 3 or not all(isinstance(r, str) and r.strip() for r in refs):
+            refs = base["evidenceRefs"]
         else:
-            print(f"[LLM] Chunk fallback triggered: {res}")
-            for _ in ch:
-                merged_all.append(baseline[idx])
-                idx += 1
+            fixed_refs = []
+            for r in refs:
+                r_clean = r.strip()
+                if r_clean in pkg_raw and r_clean.startswith("[") and r_clean.endswith("]"):
+                    fixed_refs.append(r_clean)
+                elif f"[{r_clean}]" in pkg_raw:
+                    fixed_refs.append(f"[{r_clean}]")
+                else:
+                    fixed_refs.append(r_clean)
+            refs = fixed_refs
+
+        rat = str(item.get("rationale") or "").strip()
+        if len(rat) < 65 or act not in rat or sum(1 for r in refs if r in rat) < 2:
+            rat = (
+                f"Action {act} is chosen for invoice {inv_no} from {vendor} ({amt} {curr}) "
+                f"supported by decisive evidence {refs[0]}, {refs[1]}, and {refs[2]}: {rat}"
+            ).strip()
+
+        merged_all.append({
+            "action": act,
+            "facts": {
+                "vendorName": vendor,
+                "invoiceNumber": inv_no,
+                "amountMinor": amt,
+                "currency": curr
+            },
+            "evidenceRefs": refs,
+            "rationale": rat[:1450]
+        })
 
     return merged_all
 
 
+def get_available_gemini_models(gemini_key: str) -> List[str]:
+    global discovered_gemini_models
+    if discovered_gemini_models:
+        return discovered_gemini_models
+
+    # Priority order starting with gemini-3.0-flash as requested by Google's error message!
+    candidates = [
+        "gemini-3.0-flash",
+        "gemini-3.0-flash-preview",
+        "gemini-3-flash",
+        "gemini-3-flash-preview",
+        "gemini-flash-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite-preview-06-17",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+    ]
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            api_models = []
+            for m in data.get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and ("flash" in name or "gemini-3" in name or "pro" in name):
+                    api_models.append(name)
+            print(f"[LLM] Discovered models on key: {api_models}")
+            # Put any discovered gemini-3 / flash models first
+            ordered = []
+            for pref in ["gemini-3.0-flash", "gemini-3-flash", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+                for am in api_models:
+                    if am == pref and am not in ordered:
+                        ordered.append(am)
+            for am in api_models:
+                if "flash" in am and am not in ordered and "tts" not in am and "image" not in am and "audio" not in am:
+                    ordered.append(am)
+            for c in candidates:
+                if c not in ordered:
+                    ordered.append(c)
+            discovered_gemini_models = ordered
+            return discovered_gemini_models
+    except Exception as e:
+        print(f"[LLM] Model discovery error: {e}")
+        return candidates
+
+
 def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
+    global discovered_gemini_models
     if gemini_key:
-        models_to_try = [
-            ("gemini-2.5-flash", True),
-            ("gemini-2.0-flash", False),
-            ("gemini-2.5-flash", False),
-        ]
-        for model_name, use_thinking_cfg in models_to_try:
+        models_to_try = get_available_gemini_models(gemini_key)
+        for model_name in models_to_try[:5]:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
                 gen_cfg: Dict[str, Any] = {
@@ -865,9 +913,6 @@ def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
                     "temperature": 0.0,
                     "maxOutputTokens": 8192
                 }
-                if use_thinking_cfg:
-                    gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
-
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": gen_cfg
@@ -877,7 +922,7 @@ def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=25) as resp:
+                with urllib.request.urlopen(req, timeout=35) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     parts = data["candidates"][0]["content"]["parts"]
                     text = ""
@@ -887,18 +932,22 @@ def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
                     text = text.strip()
                     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
                     parsed = json.loads(text)
-                    if isinstance(parsed, dict) and "proposals" in parsed:
-                        parsed = parsed["proposals"]
-                    elif isinstance(parsed, dict) and "packages" in parsed:
-                        parsed = parsed["packages"]
-                    elif isinstance(parsed, dict) and "results" in parsed:
-                        parsed = parsed["results"]
+                    if isinstance(parsed, dict):
+                        for k in ["proposals", "packages", "results", "decisions", "items"]:
+                            if k in parsed and isinstance(parsed[k], list):
+                                parsed = parsed[k]
+                                break
                     if isinstance(parsed, list):
                         print(f"[LLM] Success with {model_name} ({len(parsed)} items)")
+                        # Pin working model to the front of the list so subsequent calls have 0 retries!
+                        if discovered_gemini_models and discovered_gemini_models[0] != model_name:
+                            discovered_gemini_models = [model_name] + [m for m in discovered_gemini_models if m != model_name]
                         return parsed
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore")[:300]
                 print(f"[LLM] HTTPError {model_name}: {e.code} {err_body}")
+                if e.code == 404 and model_name in discovered_gemini_models:
+                    discovered_gemini_models = [m for m in discovered_gemini_models if m != model_name]
             except Exception as e:
                 print(f"[LLM] Error {model_name}: {type(e).__name__}: {e}")
 
@@ -917,7 +966,7 @@ def call_llm_sync(prompt: str, gemini_key: str, openai_key: str) -> Any:
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"}
             )
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=35) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 text = data["choices"][0]["message"]["content"].strip()
                 text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
